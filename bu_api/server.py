@@ -135,6 +135,7 @@ def _resolve_session(name: str, cdp_url: str | None = None) -> Any:
                 headless=existing.headless,
                 start_url=existing.start_url,
                 profile_dir=existing.profile_dir,
+                browser=existing.browser,
             )
         session_store.touch(name)
         return existing
@@ -151,12 +152,28 @@ def _ensure_daemon(session: str, cdp_url: str | None) -> None:
     admin.ensure_daemon(None, session, env)
 
 
+def _record_action(name: str, args: tuple = (), kwargs: dict | None = None, duration: float | None = None) -> None:
+    """Use the CLI recorder for supported HTTP actions; it handles capture failures."""
+    from browser_harness import recorder
+    recorder.observe(name, args, kwargs or {}, duration)
+
+
 def _run_sync(fn, *args, **kwargs):
     """Run a blocking helper in a worker thread with stdout/stderr captured."""
     buf_out, buf_err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         result = fn(*args, **kwargs)
     return result, buf_out.getvalue(), buf_err.getvalue()
+
+
+def _run_recorded_tool(name: str, args: dict) -> tuple[Any, str, str]:
+    started = time.perf_counter()
+    result, out, err = _run_sync(call_tool, name, args)
+    if name == "click_selector" and isinstance(result, dict) and result.get("hit_target"):
+        _record_action("click_at_xy", (), {"x": result["x"], "y": result["y"]}, round(time.perf_counter() - started, 3))
+    elif name != "click_selector":
+        _record_action(name, (), args, round(time.perf_counter() - started, 3))
+    return result, out, err
 
 
 # --------------------------------------------------------------------- routes ---
@@ -180,6 +197,15 @@ async def tools(x_api_key: str | None = Header(default=None)) -> dict:
     """Self-describing catalogue of every command, with JSON schemas."""
     _check_auth(x_api_key)
     return {"count": len(TOOL_SPECS), "groups": GROUPS, "tools": describe_tools()}
+
+
+@app.get("/browsers")
+async def browsers(x_api_key: str | None = Header(default=None)) -> dict:
+    """Which browsers this host can launch: detected path per family, plus the
+    browsers the stack cannot drive (CDP-only) with the reason."""
+    _check_auth(x_api_key)
+    found = session_store.list_browsers()
+    return {"default": os.environ.get("BU_BROWSER", "chrome"), "browsers": found}
 
 
 @app.post("/tools/{name}")
@@ -211,7 +237,7 @@ async def call_tool_route(
         with _session_env(session, cdp_url, payload.get("cdp_ws")):
             try:
                 await asyncio.to_thread(_ensure_daemon, session, cdp_url)
-                result, out, err = await asyncio.to_thread(_run_sync, call_tool, name, args)
+                result, out, err = await asyncio.to_thread(_run_recorded_tool, name, args)
             except KeyError:
                 raise HTTPException(status_code=404, detail=f"unknown tool '{name}'") from None
             except TypeError as exc:
@@ -242,6 +268,46 @@ async def call_tool_route(
     return body
 
 
+
+
+def _snippet_scope() -> dict:
+    """Build the helper scope a /run snippet executes in.
+
+    Every CLI helper plus the API-side upgrades (instant-scroll clicking and a
+    page_info that waits for the document instead of crashing). The raw
+    page_info is shadowed by the guarded variant because a bare page_info()
+    right after a navigation races the document and dies with
+    "Cannot read properties of null"; the unguarded original stays reachable
+    as raw_page_info.
+    """
+    from browser_harness import admin, helpers
+
+    from . import interactions
+
+    scope: dict[str, Any] = dict(vars(helpers))
+    scope["admin"] = admin
+    scope["click_selector"] = interactions.click_selector
+    scope["guarded_page_info"] = interactions.guarded_page_info
+    scope["raw_page_info"] = helpers.page_info
+    scope["page_info"] = interactions.guarded_page_info
+    # CLI run.py wraps helpers with recorder.observe; /run must do likewise.
+    from browser_harness import recorder
+    from functools import wraps
+    for name in recorder.ACTIONS | {"click_selector"}:
+        fn = scope.get(name)
+        if not callable(fn):
+            continue
+        def traced(*args, _name=name, _fn=fn, **kwargs):
+            started = time.perf_counter()
+            result = _fn(*args, **kwargs)
+            if _name == "click_selector" and isinstance(result, dict) and result.get("hit_target"):
+                _record_action("click_at_xy", (), {"x": result["x"], "y": result["y"]}, round(time.perf_counter() - started, 3))
+            elif _name != "click_selector":
+                _record_action(_name, args, kwargs, round(time.perf_counter() - started, 3))
+            return result
+        scope[name] = wraps(fn)(traced)
+    return scope
+
 @app.post("/run")
 async def run_code(
     payload: dict = Body(...),
@@ -268,18 +334,23 @@ async def run_code(
         raise HTTPException(status_code=409, detail=str(exc)) from None
     cdp_url = resolved.cdp_url if resolved else payload.get("cdp_url")
 
+    def _exec_snippet() -> None:
+        """Run the caller's snippet in a worker thread.
+
+        Snippets are blocking by nature (waits, CDP round trips). Running them
+        directly on the ASGI event loop stalls every unrelated request while
+        one snippet is slow or stuck - so this always runs off-loop.
+        """
+        scope = _snippet_scope()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            exec(compile(code, "<api-run>", "exec"), scope)
+
     async with _lock_for(session):
         with _session_env(session, cdp_url, payload.get("cdp_ws")):
             try:
-                from browser_harness import admin, helpers
-
                 if not code.lstrip().startswith(("start_remote_daemon(", "stop_remote_daemon(")):
                     await asyncio.to_thread(_ensure_daemon, session, cdp_url)
-
-                scope: dict[str, Any] = dict(vars(helpers))
-                scope["admin"] = admin
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    exec(compile(code, "<api-run>", "exec"), scope)
+                await asyncio.to_thread(_exec_snippet)
             except Exception as exc:
                 return JSONResponse(
                     status_code=500,
@@ -405,7 +476,7 @@ async def batch(
                     raise HTTPException(status_code=404, detail=f"step {index}: unknown tool '{name}'")
                 step_started = time.perf_counter()
                 try:
-                    result, out, err = await asyncio.to_thread(_run_sync, call_tool, name, step.get("args") or {})
+                    result, out, err = await asyncio.to_thread(_run_recorded_tool, name, step.get("args") or {})
                 except Exception as exc:
                     results.append({"step": index, "tool": name, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
                     if stop_on_error:
@@ -510,6 +581,9 @@ async def create_session(
       ``headless``    launch without a visible window (default true)
       ``start_url``   page to open on launch
       ``profile_dir`` user-data-dir to reuse (persistent cookies/logins)
+      ``browser``     browser family: chrome (default), chromium, edge, brave;
+                      any other name is looked up on PATH
+      ``binary``      explicit browser executable path (overrides discovery)
     """
     _check_auth(x_api_key)
     payload = payload or {}
@@ -522,6 +596,8 @@ async def create_session(
             bool(payload.get("headless", True)),
             payload.get("start_url"),
             payload.get("profile_dir"),
+            payload.get("browser"),
+            payload.get("binary"),
         )
         await asyncio.to_thread(_ensure_daemon, name, session.cdp_url)
     except ValueError as exc:

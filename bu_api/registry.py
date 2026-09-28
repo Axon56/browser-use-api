@@ -34,10 +34,10 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
 TOOL_SPECS: dict[str, dict[str, Any]] = {
     # ---------------------------------------------------------------- core ---
     "page_info": {
-        "module": "helpers",
-        "attr": "page_info",
+        "module": "local",
+        "attr": "guarded_page_info",
         "group": "core",
-        "description": "Current tab URL, title, viewport and scroll position.",
+        "description": "Current tab URL, title, viewport and scroll position. Waits for the document to parse instead of crashing right after a navigation.",
         "schema": _schema({}),
     },
     "new_tab": {
@@ -102,6 +102,21 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "clicks": _prop("integer", "Click count.", 1),
             },
             ["x", "y"],
+        ),
+    },
+    "click_selector": {
+        "module": "local",
+        "attr": "click_selector",
+        "group": "interact",
+        "description": "Click a CSS-selected element: instant scroll into view, hit-target check, then a real CDP mouse click at its center - dispatched only when the target truly is the hit target. If something covers it (cookie bar, promo overlay), no click is sent and the result reports hit_target=false with a blocked_by description. Prefer this over scroll + click_at_xy so page smooth-scrolling cannot steal the click.",
+        "schema": _schema(
+            {
+                "selector": _prop("string", "CSS selector.", required=True),
+                "timeout": _prop("number", "Seconds to wait for the element.", 10.0),
+                "button": _prop("string", "Mouse button.", "left", enum=["left", "right", "middle"]),
+                "click_timeout": _prop("number", "Seconds to keep re-checking the hit target before giving up (no click is sent on failure).", 3.0),
+            },
+            ["selector"],
         ),
     },
     "type_text": {
@@ -401,10 +416,10 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     # ----------------------------------------------------------- recording ---
     "start_recording": {
-        "module": "recorder",
+        "module": "recording",
         "attr": "start_recording",
         "group": "recording",
-        "description": "Begin a trace recording for this task; returns the recording directory.",
+        "description": "Begin an action trace: per-action JPEG screenshots plus events.jsonl. Works for /tools, /batch and /run; returns a directory (not MP4).",
         "schema": _schema(
             {
                 "name": _prop("string", "Recording name."),
@@ -461,8 +476,12 @@ def _resolve(module_name: str, attr: str) -> Callable[..., Any]:
     """Import a helper lazily so the registry stays importable without a browser."""
     if module_name == "helpers":
         from browser_harness import helpers as mod
+    elif module_name == "local":
+        from . import interactions as mod
     elif module_name == "admin":
         from browser_harness import admin as mod
+    elif module_name == "recording":
+        from . import recording as mod
     elif module_name == "recorder":
         from browser_harness import recorder as mod
     else:  # pragma: no cover - guards against typos in TOOL_SPECS
