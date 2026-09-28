@@ -166,6 +166,24 @@ def _run_sync(fn, *args, **kwargs):
     return result, buf_out.getvalue(), buf_err.getvalue()
 
 
+def _select_tab(tab_id: str | None) -> None:
+    """Attach this request to an existing tab in the selected browser session.
+
+    Only an exact CDP target id is accepted. URL/index matches could silently
+    select the wrong tab when two tabs show the same site or their order changes.
+    """
+    if tab_id is None:
+        return
+    if not isinstance(tab_id, str) or not tab_id:
+        raise ValueError("tab_id must be a non-empty target id")
+    from browser_harness import helpers
+
+    if tab_id not in {tab["targetId"] for tab in helpers.list_tabs()}:
+        raise ValueError(f"tab_id {tab_id!r} is not an open tab in this session")
+    if helpers.current_tab()["targetId"] != tab_id:
+        helpers.switch_tab(tab_id)
+
+
 def _run_recorded_tool(name: str, args: dict) -> tuple[Any, str, str]:
     started = time.perf_counter()
     result, out, err = _run_sync(call_tool, name, args)
@@ -214,6 +232,7 @@ async def call_tool_route(
     payload: dict = Body(default_factory=dict),
     session_id: str | None = Query(default=None, description="Session to run in (from POST /sessions)"),
     session: str | None = Query(default=None, description="Alias for session_id"),
+    tab_id: str | None = Query(default=None, description="Exact targetId to attach before this action"),
     x_api_key: str | None = Header(default=None),
 ) -> dict:
     """Run a single CLI command."""
@@ -223,7 +242,8 @@ async def call_tool_route(
 
     payload = payload or {}
     session = session_id or session or payload.get("session_id") or payload.get("session") or DEFAULT_SESSION
-    args = {k: v for k, v in payload.items() if k not in {"session", "session_id", "cdp_url", "cdp_ws"}}
+    tab_id = tab_id if tab_id is not None else payload.get("tab_id")
+    args = {k: v for k, v in payload.items() if k not in {"session", "session_id", "cdp_url", "cdp_ws", "tab_id"}}
     started = time.perf_counter()
     out, err = "", ""
 
@@ -237,10 +257,11 @@ async def call_tool_route(
         with _session_env(session, cdp_url, payload.get("cdp_ws")):
             try:
                 await asyncio.to_thread(_ensure_daemon, session, cdp_url)
+                await asyncio.to_thread(_select_tab, tab_id)
                 result, out, err = await asyncio.to_thread(_run_recorded_tool, name, args)
             except KeyError:
                 raise HTTPException(status_code=404, detail=f"unknown tool '{name}'") from None
-            except TypeError as exc:
+            except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from None
             except Exception as exc:
                 return JSONResponse(
@@ -313,6 +334,7 @@ async def run_code(
     payload: dict = Body(...),
     session_id: str | None = Query(default=None),
     session: str | None = Query(default=None),
+    tab_id: str | None = Query(default=None),
     x_api_key: str | None = Header(default=None),
 ) -> dict:
     """Execute a Python snippet exactly like ``browser-use <<'PY' ... PY``.
@@ -320,6 +342,7 @@ async def run_code(
     Every CLI helper (new_tab, page_info, js, cdp, click_at_xy, ...) is already in scope.
     """
     _check_auth(x_api_key)
+    tab_id = tab_id if tab_id is not None else payload.get("tab_id")
     code = payload.get("code")
     if not isinstance(code, str) or not code.strip():
         raise HTTPException(status_code=422, detail="'code' must be a non-empty string")
@@ -350,7 +373,10 @@ async def run_code(
             try:
                 if not code.lstrip().startswith(("start_remote_daemon(", "stop_remote_daemon(")):
                     await asyncio.to_thread(_ensure_daemon, session, cdp_url)
+                await asyncio.to_thread(_select_tab, tab_id)
                 await asyncio.to_thread(_exec_snippet)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from None
             except Exception as exc:
                 return JSONResponse(
                     status_code=500,
@@ -377,6 +403,7 @@ async def screenshot(
     payload: dict = Body(default_factory=dict),
     session_id: str | None = Query(default=None),
     session: str | None = Query(default=None),
+    tab_id: str | None = Query(default=None),
     x_api_key: str | None = Header(default=None),
 ) -> Response:
     """Capture the current viewport. Returns a PNG by default, base64 JSON with ``?format=json``."""
@@ -384,6 +411,7 @@ async def screenshot(
     payload = payload or {}
     session = session_id or session or payload.get("session_id") or payload.get("session") or DEFAULT_SESSION
     fmt = payload.get("format", "png")
+    tab_id = tab_id if tab_id is not None else payload.get("tab_id")
 
     try:
         resolved = await asyncio.to_thread(_resolve_session, session, payload.get("cdp_url"))
@@ -397,6 +425,7 @@ async def screenshot(
                 from browser_harness import helpers
 
                 await asyncio.to_thread(_ensure_daemon, session, cdp_url)
+                await asyncio.to_thread(_select_tab, tab_id)
                 result, _, _ = await asyncio.to_thread(
                     _run_sync,
                     helpers.capture_screenshot,
@@ -405,6 +434,8 @@ async def screenshot(
                     payload.get("max_dim"),
                 )
                 data = Path(result).read_bytes()
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from None
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"screenshot failed: {exc}") from None
 
@@ -443,6 +474,7 @@ async def batch(
     session_id: str | None = Query(default=None),
     session: str | None = Query(default=None),
     stop_on_error: bool = Query(default=True, description="Abort the sequence on the first failure"),
+    tab_id: str | None = Query(default=None, description="Default targetId for steps without tab_id"),
     x_api_key: str | None = Header(default=None),
 ) -> dict:
     """Run several commands in order within one request.
@@ -456,6 +488,7 @@ async def batch(
         raise HTTPException(status_code=422, detail="'steps' must be a non-empty list")
 
     session = session_id or session or payload.get("session_id") or payload.get("session") or DEFAULT_SESSION
+    tab_id = tab_id if tab_id is not None else payload.get("tab_id")
     results: list[dict[str, Any]] = []
     started = time.perf_counter()
 
@@ -476,6 +509,8 @@ async def batch(
                     raise HTTPException(status_code=404, detail=f"step {index}: unknown tool '{name}'")
                 step_started = time.perf_counter()
                 try:
+                    target = step.get("tab_id", tab_id)
+                    await asyncio.to_thread(_select_tab, target)
                     result, out, err = await asyncio.to_thread(_run_recorded_tool, name, step.get("args") or {})
                 except Exception as exc:
                     results.append({"step": index, "tool": name, "ok": False, "error": f"{type(exc).__name__}: {exc}"})

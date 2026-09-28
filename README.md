@@ -88,6 +88,50 @@ Asking for either fails with a clear error instead of launching the wrong thing.
 Pass `?session_id=<id>` to any of them to pick the browser. When omitted, the default
 session is used.
 
+## Tabs within a browser session
+
+Multi-browser sessions and tabs are different: each `session_id` selects a browser;
+within that session, `list_tabs`, `current_tab`, `switch_tab`, `new_tab`, and
+`close_tab` were already exposed through `/tools/{name}`. A tab is identified by
+its CDP `targetId`, not its URL or its position in the tab list. `new_tab` may
+reuse an attached blank tab rather than create a second tab.
+
+```bash
+# Create or select a browser session, then list its tab IDs.
+curl -X POST 'localhost:8000/tools/list_tabs?session_id=demo' -H 'content-type: application/json' -d '{}'
+# Open another tab. Save the returned targetId for later calls.
+curl -X POST 'localhost:8000/tools/new_tab?session_id=demo' -H 'content-type: application/json' \
+  -d '{"url":"https://example.com"}'
+# Read or interact with one specific tab without a separate switch request.
+curl -X POST 'localhost:8000/tools/page_info?session_id=demo&tab_id=<targetId>' \
+  -H 'content-type: application/json' -d '{}'
+# Close that tab, using the underlying helper's target argument.
+curl -X POST 'localhost:8000/tools/close_tab?session_id=demo' \
+  -H 'content-type: application/json' -d '{"target":"<targetId>"}'
+```
+
+`tab_id` is supported as a query parameter or top-level JSON field on `/tools`,
+`/run`, `/batch`, and `/screenshot`. It attaches the session to that tab before
+running the action. It must be an exact `targetId` from `list_tabs` **in that
+session**; stale, cross-browser, URL and index values are rejected rather than
+silently acting on the wrong page. Omitting `tab_id` uses the currently attached
+tab. Selection does not bring a tab to the foreground; use `activate_tab` when
+that is intentional. Targeting a tab changes the attached tab for later requests
+in the same session.
+
+In `/batch`, a top-level `tab_id` is the default for each step, and any step can
+override it with its own `tab_id` alongside `tool` and `args`:
+
+```json
+{"steps":[
+  {"tool":"page_info","tab_id":"<firstTargetId>","args":{}},
+  {"tool":"page_info","tab_id":"<secondTargetId>","args":{}}
+]}
+```
+
+The session lock keeps these selections and actions ordered within a browser
+session. Tabs are not separate parallel execution lanes inside one session.
+
 ## Clicking
 
 Prefer `click_selector` over scroll + `click_at_xy`: it scrolls the element into view

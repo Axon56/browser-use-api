@@ -217,3 +217,96 @@ def test_recording_name_safety(monkeypatch, tmp_path):
     monkeypatch.setattr(recorder, "recording_dir", lambda: str(tmp_path))
     with pytest.raises(RuntimeError, match="active recording"):
         recording.start_recording("my-run")
+
+# 12. Tabs already exist; explicit targeting must use a stable target id, not URL/index.
+def test_tab_registry_and_exact_targeting(monkeypatch):
+    from browser_harness import helpers
+    from bu_api import server
+
+    for name in ("new_tab", "list_tabs", "current_tab", "switch_tab", "close_tab", "activate_tab"):
+        assert TOOL_SPECS[name]["group"] in {"core", "tabs"}
+    state = {"current": "tab-a", "switches": []}
+    monkeypatch.setattr(helpers, "list_tabs", lambda: [{"targetId": "tab-a"}, {"targetId": "tab-b"}])
+    monkeypatch.setattr(helpers, "current_tab", lambda: {"targetId": state["current"]})
+    def switch(tab):
+        state["current"] = tab
+        state["switches"].append(tab)
+    monkeypatch.setattr(helpers, "switch_tab", switch)
+    server._select_tab("tab-b")
+    server._select_tab("tab-b")
+    assert state["switches"] == ["tab-b"]
+    with pytest.raises(ValueError, match="not an open tab"):
+        server._select_tab("https://example.com")
+    with pytest.raises(ValueError, match="not an open tab"):
+        server._select_tab("tab-in-another-browser")
+    assert state["current"] == "tab-b"
+
+
+# 13. Targeted actions and batch steps select their tab before the action runs.
+def test_targeted_tool_and_batch(monkeypatch):
+    from fastapi.testclient import TestClient
+    from bu_api import server
+
+    seen = []
+    monkeypatch.setattr(server, "_resolve_session", lambda *a: None)
+    monkeypatch.setattr(server, "_ensure_daemon", lambda *a: None)
+    monkeypatch.setattr(server, "_select_tab", lambda tab: seen.append(("tab", tab)))
+    monkeypatch.setattr(server, "_run_recorded_tool", lambda name, args: (seen.append((name, args)) or name, "", ""))
+    client = TestClient(server.app)
+    response = client.post("/tools/page_info?tab_id=tab-a", json={})
+    assert response.status_code == 200
+    assert seen == [("tab", "tab-a"), ("page_info", {})]
+    seen.clear()
+    response = client.post("/batch", json={"tab_id": "tab-a", "steps": [
+        {"tool": "page_info", "args": {}},
+        {"tool": "goto_url", "tab_id": "tab-b", "args": {"url": "https://example.com"}},
+        {"tool": "page_info", "args": {"tab_id": "this-is-not-a-tool-argument"}},
+    ]})
+    assert response.status_code == 200
+    assert seen[:4] == [("tab", "tab-a"), ("page_info", {}),
+                        ("tab", "tab-b"), ("goto_url", {"url": "https://example.com"})]
+    # Bad tool argument is not mistaken for step-level routing.
+    assert seen[-2:] == [("tab", "tab-a"), ("page_info", {"tab_id": "this-is-not-a-tool-argument"})]
+
+# 14. /run and screenshot select their requested tab before reading or acting.
+def test_targeted_run_and_screenshot(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from bu_api import server
+    from browser_harness import helpers
+
+    seen = []
+    monkeypatch.setattr(server, "_resolve_session", lambda *a: None)
+    monkeypatch.setattr(server, "_ensure_daemon", lambda *a: None)
+    monkeypatch.setattr(server, "_select_tab", lambda tab: seen.append(("tab", tab)))
+    monkeypatch.setattr(server, "_snippet_scope", lambda: {"mark": lambda: seen.append(("run", None))})
+    client = TestClient(server.app)
+    response = client.post("/run", json={"tab_id": "tab-b", "code": "mark()"})
+    assert response.status_code == 200
+    assert seen == [("tab", "tab-b"), ("run", None)]
+
+    path = tmp_path / "shot.png"
+    def shot(*args):
+        seen.append(("shot", None))
+        path.write_bytes(b"png")
+        return path
+    monkeypatch.setattr(helpers, "capture_screenshot", shot)
+    seen.clear()
+    response = client.post("/screenshot?tab_id=tab-a", json={})
+    assert response.status_code == 200
+    assert response.content == b"png"
+    assert seen == [("tab", "tab-a"), ("shot", None)]
+
+
+def test_invalid_tab_is_client_error(monkeypatch):
+    from fastapi.testclient import TestClient
+    from bu_api import server
+
+    monkeypatch.setattr(server, "_resolve_session", lambda *a: None)
+    monkeypatch.setattr(server, "_ensure_daemon", lambda *a: None)
+    def fail(tab):
+        raise ValueError("tab is not open")
+    monkeypatch.setattr(server, "_select_tab", fail)
+    client = TestClient(server.app)
+    assert client.post("/tools/page_info?tab_id=stale", json={}).status_code == 422
+    assert client.post("/run?tab_id=stale", json={"code": "pass"}).status_code == 422
+    assert client.post("/screenshot?tab_id=stale", json={}).status_code == 422
