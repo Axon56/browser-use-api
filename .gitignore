@@ -1,0 +1,16 @@
+# Virtualenv
+.venv/
+venv/
+
+# Server runtime state
+.bu-api.pid
+*.log
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local env / secrets
+.env
+.env.*
